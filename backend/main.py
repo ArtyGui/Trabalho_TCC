@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from typing import List, Optional
 from datetime import datetime, timedelta
@@ -20,39 +19,16 @@ app.add_middleware(
 )
 
 # Configurações JWT
-SECRET_KEY = "sua-chave-secreta-super-segura-mude-em-producao"
+SECRET_KEY = "sua-chave-secreta-super-segura"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 horas
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 
-security = HTTPBearer()
-
-# ===== MODELOS DE AUTENTICAÇÃO =====
+# ===== ENUMS =====
 
 class UserRole(str, enum.Enum):
     ADMIN = "admin"
     OPERADOR = "operador"
     VISUALIZADOR = "visualizador"
-
-class UserInDB(BaseModel):
-    email: EmailStr
-    name: str
-    password_hash: str
-    role: UserRole
-
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-class RegisterRequest(BaseModel):
-    email: EmailStr
-    name: str
-    password: str
-
-class LoginResponse(BaseModel):
-    token: str
-    user: dict
-
-# ===== MODELOS DO SISTEMA =====
 
 class TipoContainer(str, enum.Enum):
     GP20 = "20GP"
@@ -63,28 +39,51 @@ class StatusContainer(str, enum.Enum):
     AGUARDANDO = "aguardando"
     ALOCADO = "alocado"
 
+class TipoEquipamento(str, enum.Enum):
+    REACH_STACKER = "reach_stacker"
+    RTG = "rtg"
+    TOP_LOADER = "top_loader"
+
+# ===== MODELOS =====
+
+class UserInDB(BaseModel):
+    email: EmailStr
+    name: str
+    password_hash: str
+    role: UserRole
+
 class Container(BaseModel):
     id: str
     tipo: TipoContainer
     cliente: str
+    peso: float
     data_entrada: datetime
+    data_saida_prevista: Optional[datetime] = None
     status: StatusContainer = StatusContainer.AGUARDANDO
-    endereco: Optional[str] = None
+    patio_id: Optional[int] = None  # NOVO: qual pátio
     bloco: Optional[str] = None
     rua: Optional[str] = None
     lote: Optional[str] = None
     posicao: Optional[str] = None
+    nivel: Optional[int] = None
+    endereco: Optional[str] = None
 
 class PatioConfigModel(BaseModel):
+    id: Optional[int] = None  # NOVO: ID do pátio
     nome: str
     largura: float
     comprimento: float
+    areaTotal: float
     numeroBlocos: int
     ruasPorBloco: int
     lotesPorRua: int
     posicoesPorLote: int
+    totalPosicoes: int
+    equipamento: TipoEquipamento
+    niveis_maximos: int  # NOVO: configurável manualmente
     imagemPlanta: Optional[str] = None
     observacoes: Optional[str] = None
+    ativo: bool = True  # NOVO: pátio ativo ou não
 
 class Posicao(BaseModel):
     id: str
@@ -93,35 +92,32 @@ class Posicao(BaseModel):
     blocoNome: str
     ruaNome: str
     loteNome: str
+    nivel: int
+    patio_id: int  # NOVO: pertence a qual pátio
     ocupada: bool = False
     containerId: Optional[str] = None
 
-# ===== BANCO DE DADOS EM MEMÓRIA =====
+# ===== DATABASE =====
 
 class Database:
     def __init__(self):
         self.users: List[UserInDB] = []
         self.containers: List[Container] = []
-        self.patio_config: Optional[PatioConfigModel] = None
+        self.patios: List[PatioConfigModel] = []  # NOVO: lista de pátios
         self.posicoes: List[Posicao] = []
+        self.patio_counter = 0  # NOVO: contador de IDs
         
-        # Usuários padrão
-        self._create_default_users()
+        self._criar_usuarios_padrao()
     
-    def _create_default_users(self):
-        """Cria usuários padrão no sistema"""
-        default_users = [
+    def _criar_usuarios_padrao(self):
+        usuarios = [
             {"email": "admin@logibox.com", "name": "Administrador", "password": "admin123", "role": UserRole.ADMIN},
             {"email": "operador@logibox.com", "name": "Operador", "password": "operador123", "role": UserRole.OPERADOR},
             {"email": "visualizador@logibox.com", "name": "Visualizador", "password": "visualizador123", "role": UserRole.VISUALIZADOR},
         ]
         
-        for user_data in default_users:
-            password_hash = bcrypt.hashpw(
-                user_data["password"].encode('utf-8'), 
-                bcrypt.gensalt()
-            ).decode('utf-8')
-            
+        for user_data in usuarios:
+            password_hash = bcrypt.hashpw(user_data["password"].encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
             user = UserInDB(
                 email=user_data["email"],
                 name=user_data["name"],
@@ -132,233 +128,189 @@ class Database:
 
 db = Database()
 
-# ===== FUNÇÕES DE AUTENTICAÇÃO =====
+# ===== AUTENTICAÇÃO =====
 
 def create_access_token(data: dict):
-    """Cria token JWT"""
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verifica token JWT"""
-    try:
-        token = credentials.credentials
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
-            raise HTTPException(status_code=401, detail="Token inválido")
-        return email
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expirado")
-    except jwt.JWTError:
-        raise HTTPException(status_code=401, detail="Token inválido")
+@app.get("/")
+def root():
+    return {"message": "LogiBox API v3.0 - Sistema Multi-Pátio com Empilhamento 3D"}
 
-def get_current_user(email: str = Depends(verify_token)) -> UserInDB:
-    """Obtém usuário atual do token"""
+@app.post("/auth/login")
+def login(credentials: dict):
+    email = credentials.get("email")
+    password = credentials.get("password")
+    
     user = next((u for u in db.users if u.email == email), None)
     if not user:
-        raise HTTPException(status_code=404, detail="Usuário não encontrado")
-    return user
-
-# ===== FUNÇÕES AUXILIARES =====
-
-def gerar_estrutura_patio(config: PatioConfigModel):
-    posicoes = []
-    blocos_letras = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']
-    
-    for bloco_idx in range(config.numeroBlocos):
-        bloco_nome = blocos_letras[bloco_idx] if bloco_idx < len(blocos_letras) else f"Bloco {bloco_idx + 1}"
-        
-        for rua_idx in range(config.ruasPorBloco):
-            rua_nome = f"Rua {rua_idx + 1}"
-            
-            for lote_idx in range(config.lotesPorRua):
-                lote_nome = f"Lote {lote_idx + 1}"
-                lote_id = f"{bloco_nome}-{rua_nome}-{lote_nome}"
-                
-                for pos_idx in range(config.posicoesPorLote):
-                    pos_nome = f"Pos {pos_idx + 1}"
-                    pos_id = f"{lote_id}-{pos_nome}"
-                    
-                    posicao = Posicao(
-                        id=pos_id,
-                        nome=pos_nome,
-                        loteId=lote_id,
-                        blocoNome=bloco_nome,
-                        ruaNome=rua_nome,
-                        loteNome=lote_nome,
-                        ocupada=False
-                    )
-                    posicoes.append(posicao)
-    
-    return posicoes
-
-# ===== ENDPOINTS DE AUTENTICAÇÃO =====
-
-@app.post("/auth/login", response_model=LoginResponse)
-def login(credentials: LoginRequest):
-    """Login com validação real"""
-    # Busca usuário
-    user = next((u for u in db.users if u.email == credentials.email), None)
-    
-    if not user:
         raise HTTPException(status_code=401, detail="Email ou senha incorretos")
     
-    # Verifica senha
-    if not bcrypt.checkpw(credentials.password.encode('utf-8'), user.password_hash.encode('utf-8')):
+    if not bcrypt.checkpw(password.encode('utf-8'), user.password_hash.encode('utf-8')):
         raise HTTPException(status_code=401, detail="Email ou senha incorretos")
     
-    # Cria token
     token = create_access_token({"sub": user.email, "role": user.role.value})
     
-    return LoginResponse(
-        token=token,
-        user={
+    return {
+        "token": token,
+        "user": {
             "email": user.email,
             "name": user.name,
             "role": user.role.value
         }
-    )
-
-@app.post("/auth/register")
-def register(user_data: RegisterRequest):
-    """Registro de novo usuário"""
-    # Verifica se email já existe
-    
-    if any(u.email == user_data.email for u in db.users):
-        raise HTTPException(status_code=400, detail="Email já cadastrado")
-    
-    # Valida senha
-    if len(user_data.password) < 6:
-        raise HTTPException(status_code=400, detail="Senha deve ter no mínimo 6 caracteres")
-    
-    # Hash da senha
-    password_hash = bcrypt.hashpw(
-        user_data.password.encode('utf-8'), 
-        bcrypt.gensalt()
-    ).decode('utf-8')
-    
-    # Cria usuário (novos usuários são visualizadores)
-    new_user = UserInDB(
-        email=user_data.email,
-        name=user_data.name,
-        password_hash=password_hash,
-        role=UserRole.VISUALIZADOR
-    )
-    
-    db.users.append(new_user)
-    
-    return {"message": "Usuário cadastrado com sucesso"}
-
-@app.get("/auth/me")
-def get_me(current_user: UserInDB = Depends(get_current_user)):
-    """Retorna dados do usuário logado"""
-    return {
-        "email": current_user.email,
-        "name": current_user.name,
-        "role": current_user.role.value
     }
 
-# ===== ENDPOINTS DO SISTEMA =====
+# ===== PÁTIOS (MÚLTIPLOS) =====
 
-@app.get("/")
-def read_root():
+@app.post("/patios")
+def criar_patio(config: PatioConfigModel):
+    """Cria um novo pátio"""
+    db.patio_counter += 1
+    config.id = db.patio_counter
+    
+    db.patios.append(config)
+    
+    # Gera posições para este pátio
+    blocos = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
+    
+    for b in range(config.numeroBlocos):
+        for r in range(config.ruasPorBloco):
+            for l in range(config.lotesPorRua):
+                for p in range(config.posicoesPorLote):
+                    for nivel in range(1, config.niveis_maximos + 1):
+                        posicao = Posicao(
+                            id=f"P{config.id}-{blocos[b]}-R{r+1}-L{l+1}-P{p+1}-N{nivel}",
+                            nome=f"Pos {p+1}",
+                            loteId=f"P{config.id}-{blocos[b]}-R{r+1}-L{l+1}",
+                            blocoNome=blocos[b],
+                            ruaNome=f"Rua {r+1}",
+                            loteNome=f"Lote {l+1}",
+                            nivel=nivel,
+                            patio_id=config.id,
+                            ocupada=False
+                        )
+                        db.posicoes.append(posicao)
+    
+    total_posicoes = len([p for p in db.posicoes if p.patio_id == config.id])
+    
     return {
-        "message": "LogiBox API v2.0 - Sistema Hierárquico com Autenticação",
-        "version": "2.0.0",
-        "status": "funcionando"
-    }
-
-@app.post("/patio/configurar")
-def configurar_patio(config: PatioConfigModel, current_user: UserInDB = Depends(get_current_user)):
-    # Apenas admin pode configurar
-
-    if current_user.role != UserRole.ADMIN:
-        raise HTTPException(status_code=403, detail="Apenas administradores podem configurar o pátio")
-    
-    if config.largura <= 0 or config.comprimento <= 0:
-        raise HTTPException(status_code=400, detail="Dimensões inválidas")
-    
-    db.patio_config = config
-    db.posicoes = gerar_estrutura_patio(config)
-    
-    for container in db.containers:
-        container.status = StatusContainer.AGUARDANDO
-        container.endereco = None
-    
-    total_posicoes = config.numeroBlocos * config.ruasPorBloco * config.lotesPorRua * config.posicoesPorLote
-    
-    return {
-        "message": "Pátio configurado com sucesso",
+        "message": "Pátio criado com sucesso",
+        "patio": config,
         "total_posicoes": total_posicoes
     }
 
-@app.get("/patio")
-def obter_patio(current_user: UserInDB = Depends(get_current_user)):
-    if not db.patio_config:
-        raise HTTPException(status_code=404, detail="Pátio não configurado")
+@app.get("/patios")
+def listar_patios(ativo: Optional[bool] = None):
+    """Lista todos os pátios"""
+    patios_filtrados = db.patios
     
-    total_posicoes = len(db.posicoes)
-    posicoes_ocupadas = sum(1 for p in db.posicoes if p.ocupada)
-    posicoes_livres = total_posicoes - posicoes_ocupadas
-    percentual = (posicoes_ocupadas / total_posicoes * 100) if total_posicoes > 0 else 0
+    if ativo is not None:
+        patios_filtrados = [p for p in db.patios if p.ativo == ativo]
+    
+    return {"patios": patios_filtrados}
+
+@app.get("/patios/{patio_id}")
+def obter_patio(patio_id: int):
+    """Obtém detalhes de um pátio específico"""
+    patio = next((p for p in db.patios if p.id == patio_id), None)
+    
+    if not patio:
+        raise HTTPException(status_code=404, detail="Pátio não encontrado")
+    
+    posicoes_patio = [p for p in db.posicoes if p.patio_id == patio_id]
+    total_posicoes = len(posicoes_patio)
+    ocupadas = len([p for p in posicoes_patio if p.ocupada])
+    livres = total_posicoes - ocupadas
+    percentual = (ocupadas / total_posicoes * 100) if total_posicoes > 0 else 0
     
     return {
-        "config": {
-            "nome": db.patio_config.nome,
-            "largura": db.patio_config.largura,
-            "comprimento": db.patio_config.comprimento,
-            "areaTotal": db.patio_config.largura * db.patio_config.comprimento,
-            "numeroBlocos": db.patio_config.numeroBlocos,
-            "ruasPorBloco": db.patio_config.ruasPorBloco,
-            "lotesPorRua": db.patio_config.lotesPorRua,
-            "posicoesPorLote": db.patio_config.posicoesPorLote,
-            "totalPosicoes": total_posicoes,
-            "imagemPlanta": db.patio_config.imagemPlanta,
-            "observacoes": db.patio_config.observacoes
-        },
+        "config": patio,
         "estatisticas": {
             "totalPosicoes": total_posicoes,
-            "posicoesOcupadas": posicoes_ocupadas,
-            "posicoesLivres": posicoes_livres,
+            "posicoesOcupadas": ocupadas,
+            "posicoesLivres": livres,
             "percentualOcupacao": round(percentual, 2)
         },
-        "posicoes": [p.dict() for p in db.posicoes]
+        "posicoes": posicoes_patio
     }
 
-@app.post("/containers")
-def adicionar_container(container: Container, current_user: UserInDB = Depends(get_current_user)):
-    # Operador ou admin podem adicionar as informações
-
-    if current_user.role == UserRole.VISUALIZADOR:
-        raise HTTPException(status_code=403, detail="Visualizadores não podem adicionar contêineres")
+@app.put("/patios/{patio_id}")
+def atualizar_patio(patio_id: int, config: PatioConfigModel):
+    """Atualiza configuração de um pátio"""
+    patio = next((p for p in db.patios if p.id == patio_id), None)
     
+    if not patio:
+        raise HTTPException(status_code=404, detail="Pátio não encontrado")
+    
+    # Atualiza configuração
+    config.id = patio_id
+    idx = db.patios.index(patio)
+    db.patios[idx] = config
+    
+    return {"message": "Pátio atualizado com sucesso", "patio": config}
+
+@app.delete("/patios/{patio_id}")
+def desativar_patio(patio_id: int):
+    """Desativa um pátio (não remove, apenas marca como inativo)"""
+    patio = next((p for p in db.patios if p.id == patio_id), None)
+    
+    if not patio:
+        raise HTTPException(status_code=404, detail="Pátio não encontrado")
+    
+    patio.ativo = False
+    
+    return {"message": "Pátio desativado com sucesso"}
+
+@app.delete("/patios/{patio_id}/limpar")
+def limpar_patio(patio_id: int):
+    """Limpa todas as alocações de um pátio"""
+    posicoes_patio = [p for p in db.posicoes if p.patio_id == patio_id]
+    
+    for posicao in posicoes_patio:
+        posicao.ocupada = False
+        posicao.containerId = None
+    
+    containers_patio = [c for c in db.containers if c.patio_id == patio_id]
+    for container in containers_patio:
+        container.status = StatusContainer.AGUARDANDO
+        container.endereco = None
+        container.nivel = None
+    
+    return {"message": f"Pátio {patio_id} limpo com sucesso"}
+
+# ===== CONTÊINERES =====
+
+@app.post("/containers")
+def adicionar_container(container: Container):
     if any(c.id == container.id for c in db.containers):
         raise HTTPException(status_code=400, detail="Container já existe")
     
+    # Define data de entrada como hoje se não fornecida
+    if not container.data_entrada:
+        container.data_entrada = datetime.now()
+    
     container.status = StatusContainer.AGUARDANDO
     db.containers.append(container)
-    return container.dict()
+    return container
 
 @app.get("/containers")
-def listar_containers(status: Optional[str] = None, current_user: UserInDB = Depends(get_current_user)):
+def listar_containers(status: Optional[str] = None, patio_id: Optional[int] = None):
     containers_filtrados = db.containers
     
     if status:
-        containers_filtrados = [c for c in db.containers if c.status.value == status]
+        containers_filtrados = [c for c in containers_filtrados if c.status.value == status]
     
-    return {"containers": [c.dict() for c in containers_filtrados]}
+    if patio_id:
+        containers_filtrados = [c for c in containers_filtrados if c.patio_id == patio_id]
+    
+    return {"containers": containers_filtrados}
 
 @app.delete("/containers/{container_id}")
-def remover_container(container_id: str, current_user: UserInDB = Depends(get_current_user)):
-    # Apenas admin poderá remover
-
-    if current_user.role != UserRole.ADMIN:
-        raise HTTPException(status_code=403, detail="Apenas administradores podem remover contêineres")
-    
+def remover_container(container_id: str):
     container = next((c for c in db.containers if c.id == container_id), None)
     if not container:
         raise HTTPException(status_code=404, detail="Container não encontrado")
@@ -372,16 +324,52 @@ def remover_container(container_id: str, current_user: UserInDB = Depends(get_cu
     db.containers.remove(container)
     return {"message": "Container removido com sucesso"}
 
-@app.post("/alocar")
-def alocar_containers(container_ids: List[str], current_user: UserInDB = Depends(get_current_user)):
-    """Aloca apenas os containers solicitados, mantendo os já alocados"""
+# ===== ALOCAÇÃO =====
+
+def verificar_regras_empilhamento(container: Container, posicao_base: Posicao) -> tuple[bool, str]:
+    """
+    Verifica regras de empilhamento:
+    - 20GP só empilha sobre 20GP
+    - 40GP/40HC só empilha sobre 40GP/40HC
+    - Mais pesado na base
+    - Saída próxima no topo
+    """
+    if posicao_base.nivel == 1:
+        return True, ""
     
-    # Operador ou admin podem alocar
-    if current_user.role == UserRole.VISUALIZADOR:
-        raise HTTPException(status_code=403, detail="Visualizadores não podem alocar contêineres")
+    posicao_abaixo_id = posicao_base.id.replace(f"-N{posicao_base.nivel}", f"-N{posicao_base.nivel - 1}")
+    posicao_abaixo = next((p for p in db.posicoes if p.id == posicao_abaixo_id), None)
     
-    if not db.patio_config:
-        raise HTTPException(status_code=400, detail="Pátio não configurado")
+    if not posicao_abaixo or not posicao_abaixo.ocupada:
+        return False, "Não há container abaixo"
+    
+    container_abaixo = next((c for c in db.containers if c.id == posicao_abaixo.containerId), None)
+    if not container_abaixo:
+        return False, "Container abaixo não encontrado"
+    
+    # NOVA REGRA: 20GP só empilha em 20GP, 40GP/40HC só empilha em 40GP/40HC
+    if container.tipo == TipoContainer.GP20:
+        if container_abaixo.tipo != TipoContainer.GP20:
+            return False, "Container 20GP só pode empilhar sobre outro 20GP"
+    else:  # 40GP ou 40HC
+        if container_abaixo.tipo == TipoContainer.GP20:
+            return False, "Container 40GP/40HC só pode empilhar sobre outro 40GP/40HC"
+    
+    if container.peso > container_abaixo.peso:
+        return False, "Container muito pesado para empilhar"
+    
+    if container.data_saida_prevista and container_abaixo.data_saida_prevista:
+        if container.data_saida_prevista > container_abaixo.data_saida_prevista:
+            return False, "Saída tardia não pode ficar sobre saída próxima"
+    
+    return True, ""
+
+@app.post("/patios/{patio_id}/alocar")
+def alocar_containers(patio_id: int, container_ids: List[str]):
+    """Aloca containers em um pátio específico - TODOS ocupam 1 posição"""
+    patio = next((p for p in db.patios if p.id == patio_id), None)
+    if not patio:
+        raise HTTPException(status_code=404, detail="Pátio não encontrado")
     
     resultados = []
     
@@ -390,66 +378,105 @@ def alocar_containers(container_ids: List[str], current_user: UserInDB = Depends
         if not container:
             continue
         
-        # Se tá alocado, pula
         if container.status == StatusContainer.ALOCADO:
             resultados.append({
                 "container_id": container.id,
-                "tipo": container.tipo.value,
-                "endereco": container.endereco,
                 "sucesso": True,
                 "mensagem": "Já estava alocado"
             })
             continue
         
-        vagas_necessarias = 1 if container.tipo == TipoContainer.GP20 else 2
-        posicoes_disponiveis = [p for p in db.posicoes if not p.ocupada]
+        # MUDANÇA: Todos os containers ocupam apenas 1 posição
+        vagas_necessarias = 1
         
-        if len(posicoes_disponiveis) >= vagas_necessarias:
-            posicoes_alocadas = posicoes_disponiveis[:vagas_necessarias]
+        alocado = False
+        posicoes_patio = [p for p in db.posicoes if p.patio_id == patio_id]
+        
+        bases = {}
+        for pos in posicoes_patio:
+            base_id = pos.id.rsplit('-N', 1)[0]
+            if base_id not in bases:
+                bases[base_id] = []
+            bases[base_id].append(pos)
+        
+        for base_id, niveis in sorted(bases.items()):
+            if alocado:
+                break
             
-            for posicao in posicoes_alocadas:
-                posicao.ocupada = True
-                posicao.containerId = container.id
+            niveis_ordenados = sorted(niveis, key=lambda p: p.nivel)
             
-            primeira_posicao = posicoes_alocadas[0]
-            container.status = StatusContainer.ALOCADO
-            container.bloco = primeira_posicao.blocoNome
-            container.rua = primeira_posicao.ruaNome
-            container.lote = primeira_posicao.loteNome
-            container.posicao = primeira_posicao.nome
-            
-            if vagas_necessarias == 1:
-                container.endereco = f"{primeira_posicao.blocoNome} - {primeira_posicao.ruaNome} - {primeira_posicao.loteNome} - {primeira_posicao.nome}"
-            else:
-                ultima_posicao = posicoes_alocadas[-1]
-                container.endereco = f"{primeira_posicao.blocoNome} - {primeira_posicao.ruaNome} - {primeira_posicao.loteNome} - {primeira_posicao.nome} à {ultima_posicao.nome}"
-            
+            for nivel in niveis_ordenados:
+                posicoes_nivel = [p for p in posicoes_patio 
+                                 if p.blocoNome == nivel.blocoNome 
+                                 and p.ruaNome == nivel.ruaNome 
+                                 and p.loteNome == nivel.loteNome
+                                 and p.nivel == nivel.nivel
+                                 and not p.ocupada]
+                
+                if len(posicoes_nivel) >= vagas_necessarias:
+                    posicoes_alocadas = sorted(posicoes_nivel, 
+                                              key=lambda p: int(p.nome.replace('Pos ', '')))[:vagas_necessarias]
+                    
+                    pode_alocar = True
+                    mensagem_erro = ""
+                    
+                    for pos in posicoes_alocadas:
+                        pode, msg = verificar_regras_empilhamento(container, pos)
+                        if not pode:
+                            pode_alocar = False
+                            mensagem_erro = msg
+                            break
+                    
+                    if pode_alocar:
+                        for posicao in posicoes_alocadas:
+                            posicao.ocupada = True
+                            posicao.containerId = container.id
+                        
+                        primeira_posicao = posicoes_alocadas[0]
+                        container.status = StatusContainer.ALOCADO
+                        container.patio_id = patio_id
+                        container.bloco = primeira_posicao.blocoNome
+                        container.rua = primeira_posicao.ruaNome
+                        container.lote = primeira_posicao.loteNome
+                        container.posicao = primeira_posicao.nome
+                        container.nivel = primeira_posicao.nivel
+                        
+                        # MUDANÇA: Sempre 1 posição
+                        container.endereco = f"{primeira_posicao.blocoNome} - {primeira_posicao.ruaNome} - {primeira_posicao.loteNome} - {primeira_posicao.nome} - Nível {primeira_posicao.nivel}"
+                        
+                        resultados.append({
+                            "container_id": container.id,
+                            "endereco": container.endereco,
+                            "nivel": container.nivel,
+                            "sucesso": True
+                        })
+                        
+                        alocado = True
+                        break
+        
+        if not alocado:
             resultados.append({
                 "container_id": container.id,
-                "tipo": container.tipo.value,
-                "endereco": container.endereco,
-                "sucesso": True
-            })
-        else:
-            resultados.append({
-                "container_id": container.id,
-                "tipo": container.tipo.value,
                 "sucesso": False,
-                "mensagem": "Sem espaço disponível"
+                "mensagem": mensagem_erro or "Sem espaço disponível"
             })
     
-    return {"message": "Alocação concluída", "resultados": resultados}
+    return {
+        "message": "Alocação concluída",
+        "resultados": resultados
+    }
 
-@app.post("/alocar/todos")
-def alocar_todos_containers(current_user: UserInDB = Depends(get_current_user)):
-    if current_user.role == UserRole.VISUALIZADOR:
-        raise HTTPException(status_code=403, detail="Visualizadores não podem alocar contêineres")
-    
+@app.post("/patios/{patio_id}/alocar/todos")
+def alocar_todos_patio(patio_id: int):
+    """Aloca todos os containers aguardando em um pátio específico"""
     containers_aguardando = [c for c in db.containers if c.status == StatusContainer.AGUARDANDO]
+    
     if not containers_aguardando:
         return {"message": "Nenhum container aguardando"}
     
-    return alocar_containers([c.id for c in containers_aguardando], current_user)
+    containers_ordenados = sorted(containers_aguardando, key=lambda c: c.peso, reverse=True)
+    
+    return alocar_containers(patio_id, [c.id for c in containers_ordenados])
 
 if __name__ == "__main__":
     import uvicorn
