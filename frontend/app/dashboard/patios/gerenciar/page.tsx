@@ -19,6 +19,8 @@ export default function GerenciarPatiosPage() {
   const [patios, setPatios] = useState<Patio[]>([]);
   const [loading, setLoading] = useState(false);
   const [showForm, setShowForm] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [imagemPreview, setImagemPreview] = useState<string | null>(null);
 
   const [formData, setFormData] = useState({
     nome: '',
@@ -29,7 +31,8 @@ export default function GerenciarPatiosPage() {
     lotes: '',
     posicoes: '',
     equipamento: 'reach_stacker',
-    niveis_maximos: ''
+    niveis_maximos: '',
+    imagemPlanta: ''
   });
 
   useEffect(() => {
@@ -38,11 +41,45 @@ export default function GerenciarPatiosPage() {
 
   const carregarPatios = async () => {
     try {
-      const response = await fetch('http://localhost:8000/patios');
+      // Busca apenas pátios ativos
+      const response = await fetch('http://localhost:8000/patios?ativo=true');
       const data = await response.json();
       setPatios(data.patios || []);
     } catch (error) {
       console.error('Erro ao carregar pátios:', error);
+    }
+  };
+
+  const handleImagemUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Validação de tamanho (10MB)
+    if (file.size > 10 * 1024 * 1024) {
+      alert('Arquivo muito grande! Máximo 10MB');
+      return;
+    }
+
+    setUploadingImage(true);
+
+    try {
+      // Converte para base64 para preview
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64String = reader.result as string;
+        setImagemPreview(base64String);
+        setFormData({ ...formData, imagemPlanta: base64String });
+      };
+      reader.readAsDataURL(file);
+
+      // Simula processamento (você pode adicionar OCR ou análise aqui)
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+    } catch (error) {
+      console.error('Erro ao fazer upload:', error);
+      alert('Erro ao processar imagem');
+    } finally {
+      setUploadingImage(false);
     }
   };
 
@@ -98,8 +135,10 @@ export default function GerenciarPatiosPage() {
         lotes: '',
         posicoes: '',
         equipamento: 'reach_stacker',
-        niveis_maximos: ''
+        niveis_maximos: '',
+        imagemPlanta: ''
       });
+      setImagemPreview(null);
       setShowForm(false);
       await carregarPatios();
       alert('Pátio criado com sucesso!');
@@ -112,16 +151,26 @@ export default function GerenciarPatiosPage() {
   };
 
   const handleDeletar = async (id: number) => {
-    if (!confirm('Deseja realmente deletar este pátio?')) return;
+    if (!confirm('⚠️ ATENÇÃO!\n\nDeseja realmente EXCLUIR este pátio?\n\nEsta ação não pode ser desfeita!\nTodos os dados do pátio serão permanentemente removidos.')) return;
 
     try {
-      await fetch(`http://localhost:8000/patios/${id}`, {
+      setLoading(true);
+      const response = await fetch(`http://localhost:8000/patios/${id}`, {
         method: 'DELETE'
       });
+      
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.detail || 'Erro ao deletar pátio');
+      }
+      
       await carregarPatios();
-      alert('Pátio deletado com sucesso!');
-    } catch (error) {
-      alert('Erro ao deletar pátio');
+      alert('✅ Pátio excluído com sucesso!');
+    } catch (error: any) {
+      console.error('Erro ao deletar:', error);
+      alert(`❌ Erro: ${error.message}`);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -246,24 +295,59 @@ export default function GerenciarPatiosPage() {
             {/* Dimensões */}
             <div>
               <h4 className="text-sm font-semibold text-gray-400 uppercase mb-3">Dimensões Físicas</h4>
-              <div className="grid grid-cols-2 gap-4">
-                <input
-                  type="number"
-                  min="1"
-                  placeholder="Ex: 200"
-                  value={formData.largura}
-                  onChange={(e) => setFormData({ ...formData, largura: e.target.value })}
-                  className="px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white"
-                />
-                <input
-                  type="number"
-                  min="1"
-                  placeholder="Ex: 150"
-                  value={formData.comprimento}
-                  onChange={(e) => setFormData({ ...formData, comprimento: e.target.value })}
-                  className="px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white"
-                />
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {/* Largura */}
+                <div>
+                  <label className="block text-sm text-gray-300 mb-2 font-medium">
+                    📏 Largura (metros)
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    placeholder="Ex: 200"
+                    value={formData.largura}
+                    onChange={(e) => setFormData({ ...formData, largura: e.target.value })}
+                    className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">Largura do pátio em metros</p>
+                </div>
+
+                {/* Comprimento */}
+                <div>
+                  <label className="block text-sm text-gray-300 mb-2 font-medium">
+                    📐 Comprimento (metros)
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    placeholder="Ex: 150"
+                    value={formData.comprimento}
+                    onChange={(e) => setFormData({ ...formData, comprimento: e.target.value })}
+                    className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">Comprimento do pátio em metros</p>
+                </div>
               </div>
+
+              {/* Área Calculada */}
+              {formData.largura && formData.comprimento && (
+                <div className="mt-4 p-4 bg-blue-900 bg-opacity-20 border border-blue-600 rounded-lg">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <svg className="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM14 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM4 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1v-4zM14 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
+                      </svg>
+                      <span className="text-sm text-gray-300">Área Total:</span>
+                    </div>
+                    <span className="text-lg font-bold text-blue-400">
+                      {(parseInt(formData.largura) * parseInt(formData.comprimento)).toLocaleString('pt-BR')} m²
+                    </span>
+                  </div>
+                  <p className="text-xs text-blue-300 mt-2">
+                    {formData.largura}m × {formData.comprimento}m
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Estrutura */}
@@ -339,6 +423,69 @@ export default function GerenciarPatiosPage() {
                   />
                 </div>
               </div>
+            </div>
+
+            {/* Imagem da Planta */}
+            <div>
+              <h4 className="text-sm font-semibold text-gray-400 uppercase mb-3">Imagem da Planta do Pátio</h4>
+              
+              <div className="border-2 border-dashed border-gray-700 rounded-lg p-6 text-center hover:border-blue-500 transition-colors cursor-pointer">
+                <input
+                  type="file"
+                  id="imagemPatio"
+                  accept="image/*"
+                  onChange={handleImagemUpload}
+                  className="hidden"
+                />
+                
+                {uploadingImage ? (
+                  <div className="py-8">
+                    <div className="w-16 h-16 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+                    <p className="text-gray-400 font-medium">Processando imagem...</p>
+                    <p className="text-xs text-gray-500 mt-2">Extraindo informações da planta</p>
+                  </div>
+                ) : imagemPreview ? (
+                  <div className="space-y-4">
+                    <img 
+                      src={imagemPreview} 
+                      alt="Preview da planta" 
+                      className="max-h-64 mx-auto rounded-lg border border-gray-700"
+                    />
+                    <div className="flex gap-3 justify-center">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setImagemPreview(null);
+                          setFormData({ ...formData, imagemPlanta: '' });
+                        }}
+                        className="text-red-400 hover:text-red-300 text-sm font-medium"
+                      >
+                        Remover imagem
+                      </button>
+                      <label
+                        htmlFor="imagemPatio"
+                        className="text-blue-400 hover:text-blue-300 text-sm font-medium cursor-pointer"
+                      >
+                        Trocar imagem
+                      </label>
+                    </div>
+                  </div>
+                ) : (
+                  <label htmlFor="imagemPatio" className="cursor-pointer block">
+                    <div className="py-8">
+                      <svg className="w-16 h-16 text-gray-600 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                      </svg>
+                      <p className="text-gray-400 font-medium mb-2">Clique para adicionar a planta do pátio</p>
+                      <p className="text-xs text-gray-500">PNG, JPG ou PDF até 10MB</p>
+                    </div>
+                  </label>
+                )}
+              </div>
+              
+              <p className="text-xs text-gray-500 mt-2">
+                📸 A imagem da planta será usada como referência visual do layout do pátio
+              </p>
             </div>
 
             {/* Capacidade */}
